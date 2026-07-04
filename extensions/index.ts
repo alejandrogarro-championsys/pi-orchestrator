@@ -81,7 +81,12 @@ function parseValue(raw: string): any {
 
 function parseArray(raw: string): any[] {
   const v = raw.trim();
-  if (v.startsWith("[")) return v.slice(1, -1).split(",").map(s => parseValue(s));
+  if (v === "[]") return [];
+  if (v.startsWith("[")) {
+    const inner = v.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner.split(",").map(s => parseValue(s));
+  }
   return [parseValue(v)];
 }
 
