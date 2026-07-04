@@ -18,7 +18,7 @@ Pi Orchestrator solves **Context Rot** and **excessive token consumption** by de
 ## Installation
 
 ```bash
-pi install npm:@pi-orch/orchestrator
+pi install git:github.com/alejandrogarro-championsys/pi-orchestrator@main
 ```
 
 ## Usage
