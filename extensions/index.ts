@@ -1,22 +1,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
+import { parse as parseYAML, stringify as stringifyYAML } from "yaml";
 
 /**
  * Pi Orchestrator Extension
  * Multi-agent task orchestration with parallel execution
  */
 
-// In-memory state
-interface TaskState {
+interface TaskDef {
   id: string;
   title: string;
   tier: "light" | "medium" | "heavy";
   model?: string;
-  status: "queued" | "running" | "done" | "fail" | "blocked";
   dependencies: string[];
   prompt: string;
+}
+
+interface TaskState extends TaskDef {
+  status: "queued" | "running" | "done" | "fail" | "blocked";
   retryCount: number;
   output?: string;
   error?: string;
@@ -38,179 +41,424 @@ interface PlanState {
   };
   tasks: Map<string, TaskState>;
   outputDir: string;
+  status: "idle" | "running" | "completed" | "failed";
 }
 
 let currentPlan: PlanState | null = null;
 
 export default function (pi: ExtensionAPI) {
-  // Register the /orchestrate command
+  // Register /orchestrate command
   pi.registerCommand("orchestrate", {
     description: "Orquesta ejecución multi-agente de un plan",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/);
 
-      if (parts.length < 2 || parts[0].startsWith("-")) {
+      if (parts.length < 2) {
         ctx.ui.notify("Uso: /orchestrate <spec.md> <plan.md> [opciones]", "error");
-        ctx.ui.notify("Ejemplo: /orchestrate spec.md plan.md --models light=haiku,medium=sonnet", "info");
+        ctx.ui.notify("Opciones: --models light=haiku,medium=sonnet --concurrency 4 --dry-run", "info");
         return;
       }
 
-      const specFile = resolve(ctx.cwd, parts[0]);
-      const planFile = resolve(ctx.cwd, parts[1]);
-      const options = parts.slice(2);
+      const specPath = resolve(ctx.cwd, parts[0]);
+      const planPath = resolve(ctx.cwd, parts[1]);
+      const cliConfig = parseOptions(parts.slice(2));
 
-      // Validate files exist
-      if (!existsSync(specFile)) {
-        ctx.ui.notify(`Error: ${parts[0]} no encontrado`, "error");
+      // Validate files
+      if (!existsSync(specPath)) {
+        ctx.ui.notify(`❌ Spec no encontrado: ${parts[0]}`, "error");
         return;
       }
-      if (!existsSync(planFile)) {
-        ctx.ui.notify(`Error: ${parts[1]} no encontrado`, "error");
+      if (!existsSync(planPath)) {
+        ctx.ui.notify(`❌ Plan no encontrado: ${parts[1]}`, "error");
         return;
       }
-
-      // Parse options
-      const cliConfig = parseOptions(options);
 
       // Parse plan.md
-      const planContent = readFileSync(planFile, "utf-8");
-      const parsed = parsePlanYaml(planContent);
+      const planContent = readFileSync(planPath, "utf-8");
+      const frontmatterMatch = planContent.match(/^---\n([\s\S]*?)\n---/);
 
-      if (!parsed) {
-        ctx.ui.notify("Error: YAML frontmatter inválido en plan.md", "error");
+      if (!frontmatterMatch) {
+        ctx.ui.notify("❌ plan.md no tiene YAML frontmatter válido", "error");
+        return;
+      }
+
+      let planYaml: any;
+      try {
+        planYaml = parseYAML(frontmatterMatch[1]);
+      } catch (e: any) {
+        ctx.ui.notify(`❌ Error parseando YAML: ${e.message}`, "error");
+        return;
+      }
+
+      if (!planYaml?.tasks || !Array.isArray(planYaml.tasks)) {
+        ctx.ui.notify("❌ plan.md no tiene lista de tareas válida", "error");
         return;
       }
 
       // Merge config: CLI > plan.md > defaults
       const models = {
-        light: cliConfig.models.light || parsed.models?.light || "haiku",
-        medium: cliConfig.models.medium || parsed.models?.medium || "sonnet",
-        heavy: cliConfig.models.heavy || parsed.models?.heavy || "opus",
+        light: cliConfig.models.light || planYaml.models?.light || "haiku",
+        medium: cliConfig.models.medium || planYaml.models?.medium || "sonnet",
+        heavy: cliConfig.models.heavy || planYaml.models?.heavy || "opus",
       };
 
       const config = {
-        maxConcurrentWorkers: cliConfig.concurrency || parsed.config?.max_concurrent_workers || 4,
-        maxRetries: cliConfig.retries || parsed.config?.max_retries || 3,
-        timeoutPerTaskMs: cliConfig.timeout || parsed.config?.timeout_per_task_ms || 300000,
+        maxConcurrentWorkers: cliConfig.concurrency || planYaml.config?.max_concurrent_workers || 4,
+        maxRetries: cliConfig.retries || planYaml.config?.max_retries || 3,
+        timeoutPerTaskMs: cliConfig.timeout || planYaml.config?.timeout_per_task_ms || 300000,
       };
 
-      // Initialize plan state
+      const outputDir = resolve(ctx.cwd, cliConfig.outputDir || "./output");
+      mkdirSync(outputDir, { recursive: true });
+
+      // Initialize plan
       currentPlan = {
-        planId: parsed.plan_id || `plan-${Date.now()}`,
-        specFile,
-        planFile,
+        planId: planYaml.plan_id || `plan-${Date.now()}`,
+        specFile: specPath,
+        planFile: planPath,
         config,
         models,
         tasks: new Map(),
-        outputDir: resolve(ctx.cwd, cliConfig.outputDir || "./output"),
+        outputDir,
+        status: "idle",
       };
 
-      // Load spec content for context
-      const specContent = readFileSync(specFile, "utf-8");
-
-      // Initialize tasks
-      for (const taskDef of parsed.tasks || []) {
-        const task: TaskState = {
+      // Load tasks
+      for (const taskDef of planYaml.tasks) {
+        currentPlan.tasks.set(taskDef.id, {
           id: taskDef.id,
           title: taskDef.title,
           tier: taskDef.tier || "medium",
           model: taskDef.model,
-          status: "queued",
           dependencies: taskDef.dependencies || [],
           prompt: taskDef.prompt || taskDef.title,
+          status: "queued",
           retryCount: 0,
-        };
-        currentPlan.tasks.set(task.id, task);
+        });
       }
 
-      // Dry run mode
+      const specContent = readFileSync(specPath, "utf-8");
+
+      // Dry run
       if (cliConfig.dryRun) {
-        showDryRun(ctx, currentPlan, specContent);
+        showDryRun(ctx, currentPlan);
         return;
       }
 
-      // Start orchestration
-      ctx.ui.notify(`🚀 Orchestrator: Iniciando ${currentPlan.tasks.size} tareas`, "info");
-      ctx.ui.notify(`📊 Models: light=${models.light}, medium=${models.medium}, heavy=${models.heavy}`, "info");
-      ctx.ui.setStatus("orchestrator", `🐙 Orchestrating: ${currentPlan.tasks.size} tasks`);
+      // Execute
+      ctx.ui.notify(`🚀 Orchestrator: ${currentPlan.tasks.size} tareas`, "info");
+      ctx.ui.notify(`📊 Modelos: light=${models.light}, medium=${models.medium}, heavy=${models.heavy}`, "info");
+      ctx.ui.setStatus("orchestrator", `🐙 ${currentPlan.tasks.size} tasks`);
 
-      // Start executing ready tasks
-      await executeReadyTasks(pi, ctx, currentPlan, specContent);
+      currentPlan.status = "running";
+      await runOrchestration(pi, ctx, currentPlan, specContent);
     },
   });
 
-  // Register the orchestrate tool for LLM
+  // Register orchestrate tool for LLM
   pi.registerTool({
     name: "orchestrate",
     label: "Orchestrate",
-    description: "Ejecuta un plan de implementación usando múltiples subagentes en paralelo",
+    description: "Ejecuta un plan multi-agente desde un spec.md y plan.md",
     parameters: Type.Object({
-      spec_file: Type.String({ description: "Ruta al archivo spec.md" }),
-      plan_file: Type.String({ description: "Ruta al archivo plan.md" }),
-      models: Type.Optional(Type.String({
-        description: "Configuración de modelos: light=haiku,medium=sonnet,heavy=opus"
-      })),
-      concurrency: Type.Optional(Type.Number({
-        description: "Máximo de workers concurrentes (default: 4)"
-      })),
-      dry_run: Type.Optional(Type.Boolean({
-        description: "Solo parsear, no ejecutar"
-      })),
+      spec_file: Type.String({ description: "Ruta al spec.md" }),
+      plan_file: Type.String({ description: "Ruta al plan.md" }),
+      models: Type.Optional(Type.String({ description: "light=haiku,medium=sonnet,heavy=opus" })),
+      concurrency: Type.Optional(Type.Number({ description: "Workers máximos (default: 4)" })),
+      dry_run: Type.Optional(Type.Boolean({ description: "Solo mostrar plan" })),
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      onUpdate?.({ content: [{ type: "text", text: `Iniciando orquestación: ${params.spec_file} → ${params.plan_file}` }] });
+      onUpdate?.({ content: [{ type: "text", text: `Parseando: ${params.plan_file}...` }] });
 
-      const specFile = resolve(ctx.cwd, params.spec_file);
-      const planFile = resolve(ctx.cwd, params.plan_file);
-
-      if (!existsSync(specFile) || !existsSync(planFile)) {
-        return {
-          content: [{ type: "text", text: "Error: Archivos no encontrados" }],
-          details: { error: "Files not found" },
-        };
+      const planPath = resolve(ctx.cwd, params.plan_file);
+      if (!existsSync(planPath)) {
+        return { content: [{ type: "text", text: `Error: ${params.plan_file} no encontrado` }], details: {} };
       }
 
-      const planContent = readFileSync(planFile, "utf-8");
-      const parsed = parsePlanYaml(planContent);
-
-      if (!parsed) {
-        return {
-          content: [{ type: "text", text: "Error: YAML inválido en plan.md" }],
-          details: { error: "Invalid YAML" },
-        };
+      const content = readFileSync(planPath, "utf-8");
+      const match = content.match(/^---\n([\s\S]*?)\n---/);
+      if (!match) {
+        return { content: [{ type: "text", text: "Error: YAML frontmatter no encontrado" }], details: {} };
       }
 
-      const taskCount = (parsed.tasks || []).length;
-      const taskList = (parsed.tasks || []).map((t: any) =>
-        `• ${t.id}: ${t.title} (${t.tier || "medium"})`
+      const yaml = parseYAML(match[1]);
+      const tasks = yaml?.tasks || [];
+
+      const summary = tasks.map((t: any) =>
+        `• ${t.id}: ${t.title} [${t.tier || "medium"}]`
       ).join("\n");
 
       return {
-        content: [{
-          type: "text",
-          text: `Plan parseado: ${taskCount} tareas encontradas\n\n${taskList}\n\nUse /orchestrate ${params.spec_file} ${params.plan_file} para ejecutar.`
-        }],
-        details: {
-          plan_id: parsed.plan_id,
-          task_count: taskCount,
-          tasks: parsed.tasks,
-        },
+        content: [{ type: "text", text: `📋 ${tasks.length} tareas encontradas:\n\n${summary}\n\nPara ejecutar: /orchestrate ${params.spec_file} ${params.plan_file}` }],
+        details: { task_count: tasks.length },
       };
     },
   });
 
-  // Session lifecycle
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("orchestrator", "🐙 Orchestrator ready");
+    ctx.ui.setStatus("orchestrator", "🐙 Ready");
   });
 
-  pi.on("session_shutdown", async (_event, _ctx) => {
+  pi.on("session_shutdown", async () => {
     currentPlan = null;
   });
 }
 
 /**
- * Parse CLI-style options into config object
+ * Run orchestration loop
+ */
+async function runOrchestration(
+  pi: ExtensionAPI,
+  ctx: any,
+  plan: PlanState,
+  specContent: string
+) {
+  while (plan.status === "running") {
+    // Find ready tasks
+    const ready = getReadyTasks(plan);
+
+    if (ready.length === 0) {
+      const allDone = Array.from(plan.tasks.values()).every(
+        t => t.status === "done" || t.status === "blocked"
+      );
+
+      if (allDone) {
+        plan.status = "completed";
+        ctx.ui.notify("✅ ¡Plan completado!", "info");
+        ctx.ui.setStatus("orchestrator", "✅ Done");
+        persistPlan(plan);
+        break;
+      }
+
+      // Wait and check again
+      await sleep(500);
+      continue;
+    }
+
+    // Execute ready tasks in parallel
+    const running = Array.from(plan.tasks.values()).filter(t => t.status === "running").length;
+    const slots = plan.config.maxConcurrentWorkers - running;
+    const toExecute = ready.slice(0, Math.max(1, slots));
+
+    ctx.ui.notify(`▶ Ejecutando: ${toExecute.map(t => t.id).join(", ")}`, "info");
+
+    // Run tasks in parallel
+    const promises = toExecute.map(task =>
+      executeTask(pi, ctx, task, plan, specContent).catch(err => {
+        console.error(`Task ${task.id} error:`, err);
+      })
+    );
+
+    await Promise.all(promises);
+
+    // Persist after each batch
+    persistPlan(plan);
+  }
+}
+
+/**
+ * Get tasks ready to execute (queued with all deps done)
+ */
+function getReadyTasks(plan: PlanState): TaskState[] {
+  return Array.from(plan.tasks.values()).filter(task => {
+    if (task.status !== "queued") return false;
+    return task.dependencies.every(depId => {
+      const dep = plan.tasks.get(depId);
+      return dep?.status === "done";
+    });
+  });
+}
+
+/**
+ * Execute a single task
+ */
+async function executeTask(
+  pi: ExtensionAPI,
+  ctx: any,
+  task: TaskState,
+  plan: PlanState,
+  specContent: string
+) {
+  task.status = "running";
+  ctx.ui.setStatus("orchestrator", `🐙 ${task.title}`);
+
+  const workerPrompt = buildWorkerPrompt(task, specContent, plan);
+  const taskDir = resolve(plan.outputDir, task.id);
+  mkdirSync(taskDir, { recursive: true });
+
+  try {
+    // Create isolated session for worker
+    let workerResult = "";
+
+    await ctx.newSession({
+      parentSession: ctx.sessionManager.getSessionFile(),
+      setup: async (sm) => {
+        sm.appendMessage({
+          role: "user",
+          content: [{ type: "text", text: workerPrompt }],
+          timestamp: Date.now(),
+        });
+      },
+      withSession: async (workerCtx) => {
+        // Notify user
+        ctx.ui.notify(`🔄 Worker: ${task.title}`, "info");
+
+        // Send task
+        await workerCtx.sendUserMessage(workerPrompt);
+
+        // Wait for completion
+        await workerCtx.waitForIdle();
+
+        // Get result
+        const entries = workerCtx.sessionManager.getEntries();
+        const lastAssistant = entries
+          .filter((e: any) => e.role === "assistant")
+          .pop();
+
+        if (lastAssistant) {
+          workerResult = typeof lastAssistant.content === "string"
+            ? lastAssistant.content
+            : JSON.stringify(lastAssistant.content);
+
+          // Try to parse JSON result
+          const jsonMatch = workerResult.match(/\{[\s\S]*"task_id"[\s\S]*\}/);
+          if (jsonMatch) {
+            try {
+              const result = JSON.parse(jsonMatch[0]);
+              if (result.status === "done") {
+                task.status = "done";
+                task.output = result.output?.summary || workerResult;
+                ctx.ui.notify(`✅ ${task.id}: Completado`, "info");
+              } else {
+                task.status = "fail";
+                task.error = result.error || "Worker returned fail";
+                ctx.ui.notify(`❌ ${task.id}: Falló - ${task.error}`, "error");
+              }
+            } catch {
+              // JSON parse failed, assume success
+              task.status = "done";
+              task.output = workerResult;
+              ctx.ui.notify(`✅ ${task.id}: Completado (output raw)`, "info");
+            }
+          } else {
+            task.status = "done";
+            task.output = workerResult;
+            ctx.ui.notify(`✅ ${task.id}: Completado`, "info");
+          }
+        } else {
+          task.status = "fail";
+          task.error = "No output from worker";
+          ctx.ui.notify(`❌ ${task.id}: Sin output`, "error");
+        }
+      },
+    });
+  } catch (error: any) {
+    task.retryCount++;
+
+    if (task.retryCount < plan.config.maxRetries) {
+      task.status = "queued";
+      ctx.ui.notify(`⚠️ ${task.id}: Error, retry ${task.retryCount}/${plan.config.maxRetries}`, "error");
+    } else {
+      task.status = "blocked";
+      task.error = error.message || "Max retries exceeded";
+      ctx.ui.notify(`🚫 ${task.id}: Bloqueado`, "error");
+    }
+  }
+}
+
+/**
+ * Build worker prompt
+ */
+function buildWorkerPrompt(task: TaskState, specContent: string, plan: PlanState): string {
+  const model = task.model || plan.models[task.tier];
+  const doneTasks = Array.from(plan.tasks.values())
+    .filter(t => t.status === "done" && t.output)
+    .map(t => `### ${t.title}\n${t.output}`)
+    .join("\n\n");
+
+  return `Eres un worker de Pi Orchestrator. Ejecuta esta tarea de forma aislada.
+
+## Tarea Asignada
+- ID: ${task.id}
+- Título: ${task.title}
+- Modelo: ${model}
+
+## Instrucción
+${task.prompt}
+
+## Contexto del Proyecto
+${specContent.substring(0, 3000)}
+
+${doneTasks ? `\n## Tareas Completadas Anteriormente\n${doneTasks}` : ""}
+
+## Reglas
+1. Ejecuta SOLO esta tarea
+2. Usa las herramientas bash, read, write, edit
+3. Al terminar, responde EXACTAMENTE con este JSON:
+\`\`\`json
+{"task_id": "${task.id}", "status": "done", "output": {"summary": "resumen", "files_created": []}}
+\`\`\`
+
+Si hay error:
+\`\`\`json
+{"task_id": "${task.id}", "status": "fail", "error": "descripción"}
+\`\`\``;
+}
+
+/**
+ * Show dry run
+ */
+function showDryRun(ctx: any, plan: PlanState) {
+  const tasks = Array.from(plan.tasks.values());
+  const ready = getReadyTasks(plan);
+
+  let msg = `\n📋 Plan: ${plan.planId}\n`;
+  msg += `📊 Total: ${tasks.length} tareas\n`;
+  msg += `⚡ Concurrencia: ${plan.config.maxConcurrentWorkers}\n\n`;
+
+  msg += `Tareas:\n`;
+  for (const task of tasks) {
+    const model = task.model || plan.models[task.tier];
+    const deps = task.dependencies.length > 0 ? ` ← [${task.dependencies.join(", ")}]` : "";
+    msg += `  • ${task.id}: ${task.title} (${task.tier} → ${model})${deps}\n`;
+  }
+
+  msg += `\n🚀 Listas ahora: ${ready.map(t => t.id).join(", ") || "ninguna"}\n`;
+
+  ctx.ui.notify(msg, "info");
+}
+
+/**
+ * Persist plan state
+ */
+function persistPlan(plan: PlanState) {
+  try {
+    const content = readFileSync(plan.planFile, "utf-8");
+    const match = content.match(/^(---\n[\s\S]*?\n---)/);
+    if (!match) return;
+
+    let yaml = parseYAML(match[1]);
+
+    // Update task statuses
+    if (yaml?.tasks) {
+      for (const task of yaml.tasks) {
+        const state = plan.tasks.get(task.id);
+        if (state) {
+          task.status = state.status;
+        }
+      }
+    }
+
+    const newYaml = stringifyYAML(yaml);
+    const newContent = `---\n${newYaml}---` + content.slice(match[0].length);
+    writeFileSync(plan.planFile, newContent, "utf-8");
+  } catch (e) {
+    console.error("Persist error:", e);
+  }
+}
+
+/**
+ * Parse CLI options
  */
 function parseOptions(args: string[]) {
   const config = {
@@ -219,325 +467,32 @@ function parseOptions(args: string[]) {
     retries: 0,
     models: {} as Record<string, string>,
     dryRun: false,
-    resume: false,
     outputDir: "",
   };
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-
-    if (arg === "--concurrency" || arg === "-c") {
+    if ((arg === "--concurrency" || arg === "-c") && args[i + 1]) {
       config.concurrency = parseInt(args[++i], 10) || 4;
-    } else if (arg === "--timeout" || arg === "-t") {
+    } else if ((arg === "--timeout" || arg === "-t") && args[i + 1]) {
       config.timeout = parseInt(args[++i], 10) || 300000;
-    } else if (arg === "--retries" || arg === "-r") {
+    } else if ((arg === "--retries" || arg === "-r") && args[i + 1]) {
       config.retries = parseInt(args[++i], 10) || 3;
-    } else if (arg === "--models" || arg === "-m") {
-      const modelStr = args[++i] || "";
-      for (const pair of modelStr.split(",")) {
+    } else if ((arg === "--models" || arg === "-m") && args[i + 1]) {
+      for (const pair of args[++i].split(",")) {
         const [tier, model] = pair.split("=");
-        if (tier && model) {
-          config.models[tier.trim()] = model.trim();
-        }
+        if (tier && model) config.models[tier.trim()] = model.trim();
       }
     } else if (arg === "--dry-run" || arg === "-d") {
       config.dryRun = true;
-    } else if (arg === "--resume") {
-      config.resume = true;
-    } else if (arg === "--output" || arg === "-o") {
-      config.outputDir = args[++i] || "";
+    } else if ((arg === "--output" || arg === "-o") && args[i + 1]) {
+      config.outputDir = args[++i];
     }
   }
 
   return config;
 }
 
-/**
- * Parse YAML frontmatter from plan.md
- */
-function parsePlanYaml(content: string): any {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-
-  try {
-    // Simple YAML parser for frontmatter
-    const yamlStr = match[1];
-    const result: any = {};
-    let currentSection: any = result;
-    let currentKey = "";
-
-    const lines = yamlStr.split("\n");
-    for (const line of lines) {
-      const indent = line.search(/\S/);
-      const trimmed = line.trim();
-
-      if (!trimmed || trimmed.startsWith("#")) continue;
-
-      const kvMatch = trimmed.match(/^(\w[\w_]*):\s*(.*)/);
-      if (kvMatch) {
-        const [, key, value] = kvMatch;
-
-        if (value === "" || value === undefined) {
-          // This is a section header
-          currentSection[key] = {};
-          currentSection = currentSection[key];
-          currentKey = key;
-        } else {
-          // Parse value
-          let parsedValue: any = value;
-
-          // Remove quotes
-          if ((value.startsWith('"') && value.endsWith('"')) ||
-              (value.startsWith("'") && value.endsWith("'"))) {
-            parsedValue = value.slice(1, -1);
-          } else if (value === "true") {
-            parsedValue = true;
-          } else if (value === "false") {
-            parsedValue = false;
-          } else if (!isNaN(Number(value))) {
-            parsedValue = Number(value);
-          }
-
-          currentSection[key] = parsedValue;
-        }
-      } else if (trimmed.startsWith("- ") && currentKey) {
-        // Array item
-        const item = trimmed.slice(2).trim();
-        if (!Array.isArray(currentSection)) {
-          // Find parent and convert to array
-          const parentKey = Object.keys(result).find(k => result[k] === currentSection);
-          if (parentKey) {
-            result[parentKey] = [];
-            currentSection = result[parentKey];
-          }
-        }
-        if (Array.isArray(currentSection)) {
-          // Parse object item
-          const itemObj: any = {};
-          const itemKv = item.match(/^(\w[\w]*):\s*(.*)/);
-          if (itemKv) {
-            let val: any = itemKv[2];
-            if ((val.startsWith('"') && val.endsWith('"')) ||
-                (val.startsWith("'") && val.endsWith("'"))) {
-              val = val.slice(1, -1);
-            } else if (val === "true") val = true;
-            else if (val === "false") val = false;
-            else if (!isNaN(Number(val))) val = Number(val);
-            itemObj[itemKv[1]] = val;
-          }
-          currentSection.push(itemObj);
-        }
-      }
-    }
-
-    return result;
-  } catch (e) {
-    console.error("YAML parse error:", e);
-    return null;
-  }
-}
-
-/**
- * Show dry run output
- */
-function showDryRun(ctx: any, plan: PlanState, specContent: string) {
-  const tasks = Array.from(plan.tasks.values());
-  const ready = tasks.filter(t => t.status === "queued" && t.dependencies.length === 0);
-
-  let output = `\n📋 Plan: ${plan.planId}\n`;
-  output += `📊 Total tareas: ${tasks.length}\n`;
-  output += `⚡ Workers concurrentes: ${plan.config.maxConcurrentWorkers}\n\n`;
-
-  output += `Tareas:\n`;
-  for (const task of tasks) {
-    const model = task.model || plan.models[task.tier];
-    const deps = task.dependencies.length > 0 ? ` (deps: ${task.dependencies.join(", ")})` : "";
-    output += `  • ${task.id}: ${task.title} [${task.tier} → ${model}]${deps}\n`;
-  }
-
-  output += `\n🚀 Tareas listas para ejecutar: ${ready.length}\n`;
-  for (const task of ready) {
-    output += `  → ${task.id}: ${task.title}\n`;
-  }
-
-  ctx.ui.notify(output, "info");
-}
-
-/**
- * Execute tasks that are ready (no pending dependencies)
- */
-async function executeReadyTasks(
-  pi: ExtensionAPI,
-  ctx: any,
-  plan: PlanState,
-  specContent: string
-) {
-  const tasks = Array.from(plan.tasks.values());
-
-  // Find ready tasks
-  const ready = tasks.filter(t => {
-    if (t.status !== "queued") return false;
-    return t.dependencies.every(dep => {
-      const depTask = plan.tasks.get(dep);
-      return depTask?.status === "done";
-    });
-  });
-
-  if (ready.length === 0) {
-    // Check if all done or blocked
-    const allDone = tasks.every(t => t.status === "done" || t.status === "blocked");
-    if (allDone) {
-      ctx.ui.notify("✅ Plan completado!", "info");
-      ctx.ui.setStatus("orchestrator", "✅ Plan completed");
-      return;
-    }
-
-    // Check for blocked tasks
-    const blocked = tasks.filter(t => t.status === "blocked");
-    if (blocked.length > 0) {
-      ctx.ui.notify(`🚫 ${blocked.length} tareas bloqueadas`, "error");
-    }
-    return;
-  }
-
-  // Limit concurrency
-  const running = tasks.filter(t => t.status === "running").length;
-  const toExecute = ready.slice(0, plan.config.maxConcurrentWorkers - running);
-
-  ctx.ui.notify(`🚀 Ejecutando ${toExecute.length} tareas...`, "info");
-
-  // Execute each task as a subagent session
-  for (const task of toExecute) {
-    const model = task.model || plan.models[task.tier];
-    task.status = "running";
-    ctx.ui.setStatus("orchestrator", `🐙 Running: ${task.title}`);
-
-    // Create isolated session for worker
-    try {
-      const workerPrompt = buildWorkerPrompt(task, specContent, plan);
-
-      // Use newSession to create isolated worker
-      await ctx.newSession({
-        parentSession: ctx.sessionManager.getSessionFile(),
-        setup: async (sm) => {
-          // Add system context
-          sm.appendMessage({
-            role: "user",
-            content: [{ type: "text", text: workerPrompt }],
-            timestamp: Date.now(),
-          });
-        },
-        withSession: async (workerCtx) => {
-          // Send the task to the worker
-          await workerCtx.sendUserMessage(workerPrompt);
-
-          // Wait for completion
-          await workerCtx.waitForIdle();
-
-          // Get the result
-          const entries = workerCtx.sessionManager.getEntries();
-          const lastAssistant = entries
-            .filter((e: any) => e.role === "assistant")
-            .pop();
-
-          if (lastAssistant) {
-            task.output = typeof lastAssistant.content === "string"
-              ? lastAssistant.content
-              : JSON.stringify(lastAssistant.content);
-            task.status = "done";
-            ctx.ui.notify(`✅ ${task.id}: ${task.title} completado`, "info");
-          } else {
-            task.status = "fail";
-            task.error = "No output from worker";
-            ctx.ui.notify(`❌ ${task.id}: ${task.title} falló`, "error");
-          }
-        },
-      });
-    } catch (error: any) {
-      task.retryCount++;
-
-      if (task.retryCount < plan.config.maxRetries) {
-        ctx.ui.notify(`⚠️ ${task.id}: Error, reintentando (${task.retryCount}/${plan.config.maxRetries})`, "error");
-        task.status = "queued"; // Will retry
-      } else {
-        task.status = "blocked";
-        task.error = error.message || "Unknown error";
-        ctx.ui.notify(`🚫 ${task.id}: ${task.title} bloqueado (max reintentos)`, "error");
-      }
-    }
-  }
-
-  // Persist state
-  persistPlanState(plan);
-
-  // Continue with next batch
-  setTimeout(() => {
-    executeReadyTasks(pi, ctx, plan, specContent);
-  }, 1000);
-}
-
-/**
- * Build the worker prompt for a specific task
- */
-function buildWorkerPrompt(task: TaskState, specContent: string, plan: PlanState): string {
-  return `Eres un worker de Pi Orchestrator. Tu tarea es ejecutar una tarea específica de forma aislada.
-
-## Tu Tarea
-- ID: ${task.id}
-- Título: ${task.title}
-- Tier: ${task.tier}
-- Modelo asignado: ${task.model || plan.models[task.tier]}
-
-## Instrucción
-${task.prompt}
-
-## Contexto del Proyecto (spec.md)
-${specContent.substring(0, 2000)}
-
-## Reglas EstRICTAS
-1. Ejecuta SOLO la tarea asignada
-2. NO modifiques archivos fuera de tu directorio de trabajo
-3. Genera el output especificado
-4. Al terminar, responde con el resultado en formato JSON:
-   {
-     "task_id": "${task.id}",
-     "status": "done",
-     "output": {
-       "files_created": ["lista de archivos creados"],
-       "summary": "resumen de lo hecho",
-       "tokens_used": 0
-     }
-   }
-
-Si hay un error, responde:
-   {
-     "task_id": "${task.id}",
-     "status": "fail",
-     "error": "descripción del error"
-   }`;
-}
-
-/**
- * Persist plan state back to plan.md
- */
-function persistPlanState(plan: PlanState) {
-  try {
-    const content = readFileSync(plan.planFile, "utf-8");
-    const match = content.match(/^(---\n[\s\S]*?\n---)/);
-
-    if (!match) return;
-
-    // Update task statuses in YAML
-    let updatedYaml = match[1];
-    for (const task of plan.tasks.values()) {
-      const statusRegex = new RegExp(`(id:\\s*["']?${task.id}["']?[\\s\\S]*?status:\\s*["']?)[^"'\n]+(["']?)`, "g");
-      updatedYaml = updatedYaml.replace(statusRegex, `$1${task.status}$2`);
-    }
-
-    // Write back
-    const newContent = content.replace(match[1], updatedYaml);
-    writeFileSync(plan.planFile, newContent, "utf-8");
-  } catch (error) {
-    console.error("Failed to persist plan state:", error);
-  }
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
