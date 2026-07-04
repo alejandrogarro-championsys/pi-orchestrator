@@ -1,11 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Component } from "@earendil-works/pi-tui";
 
 /**
- * Pi Orchestrator Extension - Full Implementation
+ * Pi Orchestrator Extension
+ * Valid theme colors: accent, success, error, warning, muted, dim, text
  */
 
 // ─── YAML Parser ───────────────────────────────────────────────
@@ -13,131 +14,101 @@ function parseFrontmatter(content: string): any {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
-  const yaml = match[1];
   const result: any = {};
-  let currentSection: any = null;
-  let currentKey = "";
-  let tasks: any[] = [];
-  let currentTask: any = null;
   let inTasks = false;
+  let currentTask: any = null;
+  let currentSection: any = null;
 
-  for (const rawLine of yaml.split("\n")) {
+  for (const rawLine of match[1].split("\n")) {
     const line = rawLine.replace(/\t/g, "  ");
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
 
     const indent = line.length - line.trimStart().length;
 
-    // Top-level key: section header (no value)
-    const sectionMatch = trimmed.match(/^(\w[\w_]*):\s*$/);
-    if (sectionMatch && indent === 0) {
-      const key = sectionMatch[1];
+    // Top-level section header (no value)
+    if (indent === 0 && trimmed.match(/^(\w[\w_]*):\s*$/)) {
+      const key = trimmed.match(/^(\w[\w_]*):/)?.[1];
       if (key === "tasks") {
         inTasks = true;
         currentTask = null;
       } else {
         inTasks = false;
-        currentKey = key;
         result[key] = {};
         currentSection = result[key];
       }
       continue;
     }
 
-    // Top-level key: with value
-    const kvMatch = trimmed.match(/^(\w[\w_]*):\s*(.+)/);
-    if (kvMatch && indent === 0 && !inTasks) {
-      const [, key, rawValue] = kvMatch;
-      result[key] = parseYamlValue(rawValue);
-      currentSection = null;
-      continue;
-    }
-
-    // Inside a section (indent > 0, not in tasks)
-    if (kvMatch && indent > 0 && !inTasks && currentSection) {
-      const [, key, rawValue] = kvMatch;
-      currentSection[key] = parseYamlValue(rawValue);
-      continue;
-    }
-
-    // Array item in tasks
-    if (trimmed.startsWith("- ") && inTasks) {
-      // Save previous task
-      if (currentTask && currentTask.id) {
-        tasks.push(currentTask);
+    // Top-level key with value
+    if (indent === 0 && !inTasks) {
+      const m = trimmed.match(/^(\w[\w_]*):\s*(.+)/);
+      if (m) {
+        result[m[1]] = parseValue(m[2]);
+        currentSection = null;
+        continue;
       }
-      currentTask = {};
+    }
 
-      const itemStr = trimmed.slice(2);
-      const itemMatch = itemStr.match(/^(\w[\w_]*):\s*(.*)/);
-      if (itemMatch) {
-        const [, key, val] = itemMatch;
-        if (val === "" || val === undefined) {
-          currentTask[key] = {};
+    // Inside section
+    if (indent > 0 && !inTasks && currentSection) {
+      const m = trimmed.match(/^(\w[\w_]*):\s*(.+)/);
+      if (m) currentSection[m[1]] = parseValue(m[2]);
+      continue;
+    }
+
+    // Task array item
+    if (trimmed.startsWith("- ") && inTasks) {
+      if (currentTask?.id) result.tasks = [...(result.tasks || []), currentTask];
+      currentTask = {};
+      const m = trimmed.slice(2).match(/^(\w[\w_]*):\s*(.*)/);
+      if (m) currentTask[m[1]] = parseValue(m[2]);
+      continue;
+    }
+
+    // Task property
+    if (indent > 0 && inTasks && currentTask) {
+      const m = trimmed.match(/^(\w[\w_]*):\s*(.+)/);
+      if (m) {
+        if (m[1] === "dependencies") {
+          currentTask[m[1]] = parseArray(m[2]);
         } else {
-          currentTask[key] = parseYamlValue(val);
+          currentTask[m[1]] = parseValue(m[2]);
         }
       }
-      continue;
-    }
-
-    // Property of current task (indented under - )
-    if (kvMatch && inTasks && currentTask) {
-      const [, key, rawValue] = kvMatch;
-      if (key === "dependencies") {
-        currentTask[key] = parseYamlArray(rawValue);
-      } else {
-        currentTask[key] = parseYamlValue(rawValue);
-      }
-      continue;
     }
   }
 
-  // Push last task
-  if (currentTask && currentTask.id) {
-    tasks.push(currentTask);
-  }
-
-  if (tasks.length > 0) {
-    result.tasks = tasks;
-  }
-
+  if (currentTask?.id) result.tasks = [...(result.tasks || []), currentTask];
   return result;
 }
 
-function parseYamlValue(raw: string): any {
-  const val = raw.trim();
-  // Remove quotes
-  if ((val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))) {
-    return val.slice(1, -1);
-  }
-  if (val === "true") return true;
-  if (val === "false") return false;
-  if (val === "null" || val === "~") return null;
-  if (!isNaN(Number(val)) && val !== "") return Number(val);
-  return val;
+function parseValue(raw: string): any {
+  const v = raw.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) return v.slice(1, -1);
+  if (v === "true") return true;
+  if (v === "false") return false;
+  if (v === "null" || v === "~") return null;
+  if (!isNaN(Number(v)) && v !== "") return Number(v);
+  return v;
 }
 
-function parseYamlArray(raw: string): any[] {
-  const val = raw.trim();
-  if (val.startsWith("[")) {
-    return val.slice(1, -1).split(",").map(s => parseYamlValue(s));
-  }
-  return [parseYamlValue(val)];
+function parseArray(raw: string): any[] {
+  const v = raw.trim();
+  if (v.startsWith("[")) return v.slice(1, -1).split(",").map(s => parseValue(s));
+  return [parseValue(v)];
 }
 
-// ─── Types ─────────────────────────────────────────────────────
+// ─── Task State ────────────────────────────────────────────────
 interface TaskState {
   id: string;
   title: string;
-  tier: "light" | "medium" | "heavy";
+  tier: string;
   model?: string;
   dependencies: string[];
   prompt: string;
-  status: "queued" | "running" | "done" | "fail" | "blocked" | "cancelled";
+  status: "queued" | "running" | "done" | "fail" | "blocked";
   retryCount: number;
-  output?: string;
   error?: string;
 }
 
@@ -146,115 +117,65 @@ interface PlanState {
   specFile: string;
   planFile: string;
   models: { light: string; medium: string; heavy: string };
-  config: { maxConcurrentWorkers: number; maxRetries: number; timeoutPerTaskMs: number };
   tasks: Map<string, TaskState>;
-  status: "idle" | "running" | "completed" | "failed";
   startTime: number;
+  status: string;
 }
 
-// ─── Global State ──────────────────────────────────────────────
 let plan: PlanState | null = null;
 
-// ─── TUI Dashboard Component ───────────────────────────────────
-class OrchestratorTUI implements Component {
+// ─── TUI Component ─────────────────────────────────────────────
+class OrchestratorDashboard implements Component {
   private cursor = 0;
-  private doneCb: ((action: string) => void) | null = null;
+  private cb: ((action: string) => void) | null = null;
 
   constructor(private theme: any) {}
 
-  setDoneCallback(cb: (action: string) => void) { this.doneCb = cb; }
-
-  getState(): PlanState | null { return plan; }
+  setCallback(fn: (action: string) => void) { this.cb = fn; }
 
   render(width: number): string[] {
-    if (!plan) return [this.theme.fg("red", "No plan loaded")];
+    if (!plan) return ["No plan loaded"];
 
     const lines: string[] = [];
-    const elapsed = Math.floor((Date.now() - plan.startTime) / 1000);
-    const mins = Math.floor(elapsed / 60).toString().padStart(2, "0");
-    const secs = (elapsed % 60).toString().padStart(2, "0");
-
     const tasks = Array.from(plan.tasks.values());
     const done = tasks.filter(t => t.status === "done").length;
     const running = tasks.filter(t => t.status === "running").length;
     const queued = tasks.filter(t => t.status === "queued").length;
-    const blocked = tasks.filter(t => t.status === "blocked").length;
-    const failed = tasks.filter(t => t.status === "fail").length;
+    const elapsed = Math.floor((Date.now() - plan.startTime) / 1000);
+    const mins = String(Math.floor(elapsed / 60)).padStart(2, "0");
+    const secs = String(elapsed % 60).padStart(2, "0");
 
-    // Header
+    // Use only valid theme colors: accent, success, error, warning, muted, dim, text
     lines.push(this.theme.fg("accent", "🐙 PI ORCHESTRATOR"));
     lines.push("");
-
-    // Plan info
-    lines.push(`  Plan: ${this.theme.fg("muted", plan.planId)}`);
-
-    let statusText: string;
-    let statusIcon: string;
-    if (plan.status === "completed") {
-      statusIcon = this.theme.fg("green", "✅");
-      statusText = this.theme.fg("green", "Completed");
-    } else if (plan.status === "failed") {
-      statusIcon = this.theme.fg("red", "❌");
-      statusText = this.theme.fg("red", "Failed");
-    } else if (running > 0) {
-      statusIcon = this.theme.fg("yellow", "▶");
-      statusText = this.theme.fg("yellow", "In Progress");
-    } else {
-      statusIcon = this.theme.fg("dim", "○");
-      statusText = this.theme.fg("muted", "Ready");
-    }
-    lines.push(`  Status: ${statusIcon} ${statusText}`);
-    lines.push(`  Tasks: ${this.theme.fg("accent", `${done}/${tasks.length}`)} done | Elapsed: ${mins}:${secs}`);
+    lines.push(`  Plan: ${this.theme.fg("dim", plan.planId)}`);
+    lines.push(`  Status: ${plan.status === "completed" ? this.theme.fg("success", "Done") : this.theme.fg("warning", "Running")}`);
+    lines.push(`  Tasks: ${done}/${tasks.length} done | Elapsed: ${mins}:${secs}`);
+    lines.push("");
+    lines.push(`  Models: light=${plan.models.light} | medium=${plan.models.medium} | heavy=${plan.models.heavy}`);
     lines.push("");
 
-    // Models
-    lines.push(`  Models: light=${this.theme.fg("dim", plan.models.light)} | medium=${this.theme.fg("muted", plan.models.medium)} | heavy=${this.theme.fg("accent", plan.models.heavy)}`);
-    lines.push("");
-
-    // Tasks
     for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
-      const isSelected = i === this.cursor;
-      const prefix = isSelected ? this.theme.fg("accent", "▶ ") : "  ";
+      const t = tasks[i];
+      const sel = i === this.cursor;
+      const pre = sel ? this.theme.fg("accent", "▶ ") : "  ";
 
       let icon: string;
-      switch (task.status) {
-        case "done": icon = this.theme.fg("green", "✅"); break;
-        case "running": icon = this.theme.fg("yellow", "🔄"); break;
-        case "fail": icon = this.theme.fg("red", "❌"); break;
-        case "blocked": icon = this.theme.fg("red", "🚫"); break;
-        case "cancelled": icon = this.theme.fg("muted", "❌"); break;
-        default: icon = this.theme.fg("dim", "⏳");
+      switch (t.status) {
+        case "done": icon = "✅"; break;
+        case "running": icon = "🔄"; break;
+        case "fail": icon = "❌"; break;
+        case "blocked": icon = "🚫"; break;
+        default: icon = "⏳";
       }
 
-      const model = task.model || plan.models[task.tier];
-      let line = `${prefix}${icon} ${task.id}: ${task.title}`;
-      line += ` ${this.theme.fg("dim", `[${task.tier}→${model}]`)}`;
-
-      if (task.status === "done" && task.output) {
-        line += ` ${this.theme.fg("green", "✓")}`;
-      } else if (task.status === "fail" && task.error) {
-        line += ` ${this.theme.fg("red", task.error.substring(0, 30))}`;
-      }
-
-      lines.push(line);
+      lines.push(`${pre}${icon} ${t.id}: ${t.title} [${t.tier}]`);
     }
 
     lines.push("");
-
-    // Stats
-    const stats = [
-      this.theme.fg("green", `Done: ${done}`),
-      this.theme.fg("yellow", `Running: ${running}`),
-      this.theme.fg("muted", `Queued: ${queued}`),
-    ];
-    if (blocked > 0) stats.push(this.theme.fg("red", `Blocked: ${blocked}`));
-    if (failed > 0) stats.push(this.theme.fg("red", `Failed: ${failed}`));
-    lines.push(`  ${stats.join(" | ")}`);
-
-    // Controls
+    lines.push(this.theme.fg("dim", `  Done: ${done} | Running: ${running} | Queued: ${queued}`));
     lines.push("");
-    lines.push(this.theme.fg("dim", "  [↑↓] Navigate  [Enter] Execute  [c] Cancel  [p] Pause  [r] Resume  [Esc] Close"));
+    lines.push(this.theme.fg("dim", "  [↑↓] Nav  [Enter] Execute  [c] Cancel  [p] Pause  [Esc] Close"));
 
     return lines;
   }
@@ -262,48 +183,35 @@ class OrchestratorTUI implements Component {
   handleInput(data: string): void {
     const tasks = plan ? Array.from(plan.tasks.values()) : [];
 
-    if (data === "up" || data === "k") {
-      this.cursor = Math.max(0, this.cursor - 1);
-    } else if (data === "down" || data === "j") {
-      this.cursor = Math.min(tasks.length - 1, this.cursor + 1);
-    } else if (data === "return") {
-      this.doneCb?.("execute");
-    } else if (data === "escape") {
-      this.doneCb?.("close");
-    } else if (data === "c") {
-      const task = tasks[this.cursor];
-      if (task && (task.status === "queued" || task.status === "running")) {
-        task.status = "cancelled";
-        this.doneCb?.(`cancel:${task.id}`);
+    if (data === "up" || data === "k") this.cursor = Math.max(0, this.cursor - 1);
+    else if (data === "down" || data === "j") this.cursor = Math.min(tasks.length - 1, this.cursor + 1);
+    else if (data === "return") this.cb?.("execute");
+    else if (data === "escape") this.cb?.("close");
+    else if (data === "c") {
+      const t = tasks[this.cursor];
+      if (t && (t.status === "queued" || t.status === "running")) {
+        t.status = "blocked";
+        this.cb?.(`cancel:${t.id}`);
       }
     } else if (data === "p") {
-      const task = tasks[this.cursor];
-      if (task && task.status === "running") {
-        task.status = "queued";
-        this.doneCb?.(`pause:${task.id}`);
-      }
-    } else if (data === "r") {
-      const task = tasks[this.cursor];
-      if (task && task.status === "blocked") {
-        task.status = "queued";
-        task.retryCount = 0;
-        this.doneCb?.(`resume:${task.id}`);
+      const t = tasks[this.cursor];
+      if (t?.status === "running") {
+        t.status = "queued";
+        this.cb?.(`pause:${t.id}`);
       }
     }
   }
 }
 
-// ─── Main Extension ────────────────────────────────────────────
+// ─── Extension ─────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
 
-  // ─── /orchestrate command ────────────────────────────────────
   pi.registerCommand("orchestrate", {
     description: "Orquesta ejecución multi-agente de un plan",
     handler: async (args, ctx) => {
       try {
         const parts = args.trim().split(/\s+/);
-
-        if (parts.length < 2 || !parts[0] || !parts[1]) {
+        if (parts.length < 2) {
           ctx.ui.notify("Uso: /orchestrate <spec.md> <plan.md> [--dry-run]", "error");
           return;
         }
@@ -312,93 +220,102 @@ export default function (pi: ExtensionAPI) {
         const planPath = resolve(ctx.cwd, parts[1]);
         const dryRun = parts.includes("--dry-run") || parts.includes("-d");
 
-        // Validate files
-        if (!existsSync(specPath)) {
-          ctx.ui.notify(`❌ Spec no encontrado: ${parts[0]}`, "error");
-          return;
-        }
-        if (!existsSync(planPath)) {
-          ctx.ui.notify(`❌ Plan no encontrado: ${parts[1]}`, "error");
-          return;
-        }
+        if (!existsSync(specPath)) { ctx.ui.notify(`❌ No encontrado: ${parts[0]}`, "error"); return; }
+        if (!existsSync(planPath)) { ctx.ui.notify(`❌ No encontrado: ${parts[1]}`, "error"); return; }
 
-        // Parse plan
-        const planContent = readFileSync(planPath, "utf-8");
-        const parsed = parseFrontmatter(planContent);
+        const parsed = parseFrontmatter(readFileSync(planPath, "utf-8"));
+        if (!parsed?.tasks?.length) { ctx.ui.notify("❌ YAML inválido o sin tareas", "error"); return; }
 
-        if (!parsed) {
-          ctx.ui.notify("❌ plan.md no tiene YAML frontmatter válido", "error");
-          return;
-        }
-
-        if (!parsed.tasks || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0) {
-          ctx.ui.notify("❌ plan.md no tiene tareas válidas", "error");
-          return;
-        }
-
-        // Build plan state
         const models = {
           light: parsed.models?.light || "haiku",
           medium: parsed.models?.medium || "sonnet",
           heavy: parsed.models?.heavy || "opus",
         };
 
-        const config = {
-          maxConcurrentWorkers: parsed.config?.max_concurrent_workers || 4,
-          maxRetries: parsed.config?.max_retries || 3,
-          timeoutPerTaskMs: parsed.config?.timeout_per_task_ms || 300000,
-        };
-
         const tasks = new Map<string, TaskState>();
         for (const t of parsed.tasks) {
           tasks.set(t.id, {
-            id: t.id,
-            title: t.title,
-            tier: t.tier || "medium",
-            model: t.model,
-            dependencies: t.dependencies || [],
-            prompt: t.prompt || t.title,
-            status: "queued",
-            retryCount: 0,
+            id: t.id, title: t.title, tier: t.tier || "medium", model: t.model,
+            dependencies: t.dependencies || [], prompt: t.prompt || t.title,
+            status: "queued", retryCount: 0,
           });
         }
 
         plan = {
           planId: parsed.plan_id || `plan-${Date.now()}`,
-          specFile: specPath,
-          planFile: planPath,
-          models,
-          config,
-          tasks,
-          status: "idle",
-          startTime: Date.now(),
+          specFile: specPath, planFile: planPath, models, tasks,
+          startTime: Date.now(), status: "ready",
         };
 
-        // Dry run
         if (dryRun) {
-          showDryRun(ctx);
+          const ready = Array.from(tasks.values()).filter(t => t.dependencies.length === 0);
+          let msg = `\n📋 Plan: ${plan.planId}\n📊 ${tasks.length} tareas\n\n`;
+          for (const t of tasks.values()) {
+            msg += `  • ${t.id}: ${t.title} (${t.tier})\n`;
+          }
+          msg += `\n🚀 Listas: ${ready.map(t => t.id).join(", ") || "ninguna"}\n`;
+          ctx.ui.notify(msg, "info");
           return;
         }
 
         // Show TUI
-        const proceed = await showTUI(ctx);
+        const proceed = await new Promise<boolean>((resolve) => {
+          const dashboard = new OrchestratorDashboard(ctx.ui.theme);
+          dashboard.setCallback((action) => {
+            if (action === "close") resolve(false);
+            else if (action === "execute") resolve(true);
+          });
 
-        if (proceed) {
-          await executePlan(pi, ctx);
+          ctx.ui.custom((t, _theme, _kb, done) => {
+            dashboard.setCallback((a) => {
+              if (a === "close") done(false);
+              else if (a === "execute") done(true);
+            });
+            return dashboard;
+          });
+        });
+
+        if (!proceed) return;
+
+        // Execute via LLM
+        plan.status = "running";
+        ctx.ui.notify("🚀 Ejecutando plan...", "info");
+
+        const specContent = existsSync(specPath) ? readFileSync(specPath, "utf-8").substring(0, 3000) : "";
+        const ready = Array.from(tasks.values()).filter(t => t.dependencies.length === 0);
+
+        let msg = `## Orquestador Multi-Agente\n\nPlan: ${plan.planId}\n\n`;
+        msg += `### Configuración\n- Modelos: light=${models.light}, medium=${models.medium}, heavy=${models.heavy}\n\n`;
+        msg += `### Tareas para ejecutar AHORA\n\n`;
+
+        for (const t of ready) {
+          const model = t.model || models[t.tier as keyof typeof models] || models.medium;
+          msg += `#### ${t.id}: ${t.title}\n- Modelo: ${model}\n- Instrucción: ${t.prompt}\n\n`;
         }
+
+        const pending = Array.from(tasks.values()).filter(t => t.dependencies.length > 0);
+        if (pending.length > 0) {
+          msg += `### Tareas pendientes\n\n`;
+          for (const t of pending) {
+            msg += `#### ${t.id}: ${t.title}\n- Depende de: ${t.dependencies.join(", ")}\n- Instrucción: ${t.prompt}\n\n`;
+          }
+        }
+
+        if (specContent) msg += `### Especificación\n\n${specContent}\n\n`;
+        msg += `### Instrucciones\n1. Ejecuta tareas en orden de dependencias\n2. Reporta resultados\n`;
+
+        pi.sendMessage({ customType: "orchestrator", content: msg, display: true }, { deliverAs: "followUp", triggerTurn: true });
 
       } catch (error: any) {
         ctx.ui.notify(`❌ Error: ${error.message}`, "error");
-        console.error("Orchestrator error:", error);
       }
     },
   });
 
-  // ─── orchestrate tool ────────────────────────────────────────
   pi.registerTool({
     name: "orchestrate",
     label: "Orchestrate",
-    description: "Ejecuta un plan multi-agente desde un spec.md y plan.md",
+    description: "Ejecuta un plan multi-agente",
     parameters: Type.Object({
       spec_file: Type.String({ description: "Ruta al spec.md" }),
       plan_file: Type.String({ description: "Ruta al plan.md" }),
@@ -407,150 +324,17 @@ export default function (pi: ExtensionAPI) {
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
         const planPath = resolve(ctx.cwd, params.plan_file);
-        if (!existsSync(planPath)) {
-          return { content: [{ type: "text", text: `Error: ${params.plan_file} no encontrado` }], details: {} };
-        }
+        if (!existsSync(planPath)) return { content: [{ type: "text", text: "Error: no encontrado" }], details: {} };
 
-        const content = readFileSync(planPath, "utf-8");
-        const parsed = parseFrontmatter(content);
+        const parsed = parseFrontmatter(readFileSync(planPath, "utf-8"));
+        if (!parsed?.tasks) return { content: [{ type: "text", text: "Error: YAML inválido" }], details: {} };
 
-        if (!parsed?.tasks) {
-          return { content: [{ type: "text", text: "Error: YAML inválido o sin tareas" }], details: {} };
-        }
-
-        const summary = parsed.tasks.map((t: any) =>
-          `• ${t.id}: ${t.title} [${t.tier || "medium"}]`
-        ).join("\n");
-
-        return {
-          content: [{ type: "text", text: `📋 ${parsed.tasks.length} tareas:\n\n${summary}\n\nPara ejecutar: /orchestrate ${params.spec_file} ${params.plan_file}` }],
-          details: { task_count: parsed.tasks.length },
-        };
-      } catch (error: any) {
-        return { content: [{ type: "text", text: `Error: ${error.message}` }], details: {} };
-      }
+        const list = parsed.tasks.map((t: any) => `• ${t.id}: ${t.title} [${t.tier}]`).join("\n");
+        return { content: [{ type: "text", text: `${parsed.tasks.length} tareas:\n${list}\n\nUsa /orchestrate para ejecutar` }], details: {} };
+      } catch (e: any) { return { content: [{ type: "text", text: `Error: ${e.message}` }], details: {} }; }
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("orchestrator", "🐙 Ready");
-  });
-
-  pi.on("session_shutdown", async () => {
-    plan = null;
-  });
-}
-
-// ─── Dry Run ───────────────────────────────────────────────────
-function showDryRun(ctx: any) {
-  if (!plan) return;
-
-  const tasks = Array.from(plan.tasks.values());
-  const ready = tasks.filter(t => t.status === "queued" && t.dependencies.length === 0);
-
-  let msg = `\n📋 Plan: ${plan.planId}\n`;
-  msg += `📊 Total: ${tasks.length} tareas\n`;
-  msg += `⚡ Concurrencia: ${plan.config.maxConcurrentWorkers}\n\n`;
-
-  for (const task of tasks) {
-    const model = task.model || plan.models[task.tier];
-    const deps = task.dependencies.length > 0 ? ` ← [${task.dependencies.join(", ")}]` : "";
-    msg += `  • ${task.id}: ${task.title} (${task.tier}→${model})${deps}\n`;
-  }
-
-  msg += `\n🚀 Listas ahora: ${ready.map(t => t.id).join(", ") || "ninguna"}\n`;
-
-  ctx.ui.notify(msg, "info");
-}
-
-// ─── Show TUI ──────────────────────────────────────────────────
-async function showTUI(ctx: any): Promise<boolean> {
-  const tui = new OrchestratorTUI(ctx.ui.theme);
-
-  const result = await ctx.ui.custom<boolean>((tuiTheme, theme, keybindings, done) => {
-    tui.setDoneCallback((action) => {
-      if (action === "close") done(false);
-      else if (action === "execute") done(true);
-    });
-    return tui;
-  });
-
-  return result === true;
-}
-
-// ─── Execute Plan ──────────────────────────────────────────────
-async function executePlan(pi: ExtensionAPI, ctx: any) {
-  if (!plan) return;
-
-  plan.status = "running";
-  ctx.ui.setStatus("orchestrator", `🐙 Executing: ${plan.planId}`);
-
-  // Get spec content
-  const specContent = existsSync(plan.specFile)
-    ? readFileSync(plan.specFile, "utf-8").substring(0, 3000)
-    : "";
-
-  // Build execution message
-  const msg = buildExecutionMessage(specContent);
-
-  // Send to LLM for execution
-  ctx.ui.notify(`🚀 Enviando plan al orquestador...`, "info");
-
-  pi.sendMessage({
-    customType: "orchestrator-execution",
-    content: msg,
-    display: true,
-  }, {
-    deliverAs: "followUp",
-    triggerTurn: true,
-  });
-}
-
-function buildExecutionMessage(specContent: string): string {
-  if (!plan) return "";
-
-  const tasks = Array.from(plan.tasks.values());
-  const ready = tasks.filter(t => t.status === "queued" && t.dependencies.length === 0);
-  const pending = tasks.filter(t => t.status === "queued" && t.dependencies.length > 0);
-
-  let msg = `## 🐙 Orquestador Multi-Agente\n\n`;
-  msg += `Plan: ${plan.planId}\n\n`;
-
-  msg += `### Configuración\n`;
-  msg += `- Modelos: light=${plan.models.light}, medium=${plan.models.medium}, heavy=${plan.models.heavy}\n`;
-  msg += `- Max workers: ${plan.config.maxConcurrentWorkers}\n`;
-  msg += `- Max reintentos: ${plan.config.maxRetries}\n\n`;
-
-  if (ready.length > 0) {
-    msg += `### Tareas para ejecutar AHORA (sin dependencias)\n\n`;
-    for (const task of ready) {
-      const model = task.model || plan.models[task.tier];
-      msg += `#### ${task.id}: ${task.title}\n`;
-      msg += `- Modelo: ${model}\n`;
-      msg += `- Instrucción: ${task.prompt}\n\n`;
-    }
-  }
-
-  if (pending.length > 0) {
-    msg += `### Tareas pendientes (ejecutar cuando dependencias terminen)\n\n`;
-    for (const task of pending) {
-      const model = task.model || plan.models[task.tier];
-      msg += `#### ${task.id}: ${task.title}\n`;
-      msg += `- Modelo: ${model}\n`;
-      msg += `- Depende de: ${task.dependencies.join(", ")}\n`;
-      msg += `- Instrucción: ${task.prompt}\n\n`;
-    }
-  }
-
-  if (specContent) {
-    msg += `### Especificación del Proyecto\n\n${specContent}\n\n`;
-  }
-
-  msg += `### Instrucciones\n`;
-  msg += `1. Ejecuta las tareas en orden de dependencias\n`;
-  msg += `2. Usa subagentes para paralelizar tareas independientes\n`;
-  msg += `3. Al terminar cada tarea, reporta el resultado\n`;
-  msg += `4. Si falla, reporta el error y continúa con las demás\n`;
-
-  return msg;
+  pi.on("session_start", async (_e, ctx) => ctx.ui.setStatus("orchestrator", "🐙 Ready"));
+  pi.on("session_shutdown", async () => { plan = null; });
 }
