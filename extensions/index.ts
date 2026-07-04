@@ -208,7 +208,7 @@ class OrchestratorTUI implements Component {
     lines.push("");
 
     // Models
-    lines.push(`  Models: light=${this.theme.fg("dim", plan.models.light)} | medium=${this.theme.fg("muted", plan.models.medium)} | heavy=${this.theme.fg("bright", plan.models.heavy)}`);
+    lines.push(`  Models: light=${this.theme.fg("dim", plan.models.light)} | medium=${this.theme.fg("muted", plan.models.medium)} | heavy=${this.theme.fg("accent", plan.models.heavy)}`);
     lines.push("");
 
     // Tasks
