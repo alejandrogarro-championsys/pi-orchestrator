@@ -1,0 +1,32 @@
+{
+  "name": "@pi-orch/orchestrator",
+  "version": "0.1.0",
+  "description": "Multi-agent orchestrator for Pi Agent — parallel task execution with TUI dashboard",
+  "keywords": ["pi-package", "orchestrator", "multi-agent", "tui"],
+  "author": "Pi Orchestrator Team",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  },
+  "dependencies": {
+    "yaml": "^2.4.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "prompts",
+    "README.md",
+    "LICENSE"
+  ]
+}
